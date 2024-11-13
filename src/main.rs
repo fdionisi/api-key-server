@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -14,6 +19,12 @@ pub struct ApiKey {
     pub id: Uuid,
     pub name: String,
     pub secret: String,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct ProtectedApiKey {
+    pub id: Uuid,
+    pub name: String,
 }
 
 #[derive(Clone, Default)]
@@ -38,6 +49,20 @@ async fn create_key(
     Json(api_key).into_response()
 }
 
+async fn list_keys(State(app_state): State<AppState>) -> impl IntoResponse {
+    let keys = app_state.keys.lock().await;
+
+    Json(
+        keys.iter()
+            .map(|key| ProtectedApiKey {
+                id: key.id.clone(),
+                name: key.name.clone(),
+            })
+            .collect::<Vec<ProtectedApiKey>>(),
+    )
+    .into_response()
+}
+
 #[tokio::main]
 async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -49,6 +74,7 @@ fn app() -> Router {
 
     Router::new()
         .route("/keys", post(create_key))
+        .route("/keys", get(list_keys))
         .with_state(app_state)
 }
 
@@ -75,6 +101,10 @@ mod tests {
                 .json(&serde_json::to_value(key).unwrap())
                 .await
         }
+
+        async fn list_keys(&self) -> TestResponse {
+            self.server.get("/keys").await
+        }
     }
 
     #[tokio::test]
@@ -91,5 +121,29 @@ mod tests {
         assert_eq!(response.json::<ApiKey>().id.to_string().is_empty(), false);
         assert_eq!(response.json::<ApiKey>().name, api_key_name.clone());
         assert_eq!(response.json::<ApiKey>().secret.is_empty(), false);
+    }
+
+    #[tokio::test]
+    async fn test_list_keys() {
+        let client = TestClient::new();
+
+        let api_key_name = String::from("my api key 1");
+        client
+            .create_key(InputApiKey {
+                name: api_key_name.clone(),
+            })
+            .await;
+
+        let api_key_name = String::from("my api key 2");
+        client
+            .create_key(InputApiKey {
+                name: api_key_name.clone(),
+            })
+            .await;
+
+        let response = client.list_keys().await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.json::<Vec<ProtectedApiKey>>().len(), 2);
     }
 }
