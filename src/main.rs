@@ -27,6 +27,11 @@ pub struct ProtectedApiKey {
     pub name: String,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct LookupSecret {
+    pub secret: String,
+}
+
 #[derive(Clone, Default)]
 struct AppState {
     keys: Arc<Mutex<Vec<ApiKey>>>,
@@ -90,6 +95,23 @@ async fn regenerate_key(
     }
 }
 
+async fn lookup_key(
+    State(app_state): State<AppState>,
+    Json(lookup): Json<LookupSecret>,
+) -> impl IntoResponse {
+    let keys = app_state.keys.lock().await;
+
+    if let Some(key) = keys.iter().find(|key| key.secret == lookup.secret) {
+        Json(ProtectedApiKey {
+            id: key.id,
+            name: key.name.clone(),
+        })
+        .into_response()
+    } else {
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -104,6 +126,7 @@ fn app() -> Router {
         .route("/keys", get(list_keys))
         .route("/keys/:id", delete(delete_key))
         .route("/keys/:id", post(regenerate_key))
+        .route("/lookup", post(lookup_key))
         .with_state(app_state)
 }
 
@@ -141,6 +164,13 @@ mod tests {
 
         async fn regenerate_key(&self, id: Uuid) -> TestResponse {
             self.server.post(&format!("/keys/{}", id)).await
+        }
+
+        async fn lookup_key(&self, secret: String) -> TestResponse {
+            self.server
+                .post("/lookup")
+                .json(&LookupSecret { secret })
+                .await
         }
     }
 
@@ -222,5 +252,32 @@ mod tests {
         assert_eq!(regenerated_key.id, original_key.id);
         assert_eq!(regenerated_key.name, original_key.name);
         assert_ne!(regenerated_key.secret, original_key.secret);
+    }
+    #[tokio::test]
+    async fn test_successful_lookup_key() {
+        let client = TestClient::new();
+
+        let api_key_name = String::from("my api key");
+        let create_response = client
+            .create_key(InputApiKey {
+                name: api_key_name.clone(),
+            })
+            .await;
+        let created_key = create_response.json::<ApiKey>();
+
+        let lookup_response = client.lookup_key(created_key.secret).await;
+        assert_eq!(lookup_response.status_code(), 200);
+
+        let looked_up_key = lookup_response.json::<ProtectedApiKey>();
+        assert_eq!(looked_up_key.id, created_key.id);
+        assert_eq!(looked_up_key.name, created_key.name);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_lookup_key() {
+        let client = TestClient::new();
+
+        let invalid_lookup_response = client.lookup_key("invalid_secret".to_string()).await;
+        assert_eq!(invalid_lookup_response.status_code(), 404);
     }
 }
