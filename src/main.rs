@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use tokio::sync::Mutex;
@@ -63,6 +63,19 @@ async fn list_keys(State(app_state): State<AppState>) -> impl IntoResponse {
     .into_response()
 }
 
+async fn delete_key(State(app_state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    let mut keys = app_state.keys.lock().await;
+
+    let key_index = keys.iter().position(|key| key.id == id);
+
+    if let Some(index) = key_index {
+        let _ = keys.remove(index);
+        axum::http::StatusCode::NO_CONTENT.into_response()
+    } else {
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -75,6 +88,7 @@ fn app() -> Router {
     Router::new()
         .route("/keys", post(create_key))
         .route("/keys", get(list_keys))
+        .route("/keys/:id", delete(delete_key))
         .with_state(app_state)
 }
 
@@ -104,6 +118,10 @@ mod tests {
 
         async fn list_keys(&self) -> TestResponse {
             self.server.get("/keys").await
+        }
+
+        async fn delete_key(&self, id: Uuid) -> TestResponse {
+            self.server.delete(&format!("/keys/{}", id)).await
         }
     }
 
@@ -145,5 +163,24 @@ mod tests {
 
         assert_eq!(response.status_code(), 200);
         assert_eq!(response.json::<Vec<ProtectedApiKey>>().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_delete_key() {
+        let client = TestClient::new();
+
+        let api_key_name = String::from("my api key");
+        let response = client
+            .create_key(InputApiKey {
+                name: api_key_name.clone(),
+            })
+            .await;
+        let id = response.json::<ApiKey>().id;
+
+        let delete_response = client.delete_key(id).await;
+        assert_eq!(delete_response.status_code(), 204);
+
+        let list_response = client.list_keys().await;
+        assert_eq!(list_response.json::<Vec<ProtectedApiKey>>().len(), 0);
     }
 }
