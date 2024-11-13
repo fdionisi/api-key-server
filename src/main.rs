@@ -76,6 +76,20 @@ async fn delete_key(State(app_state): State<AppState>, Path(id): Path<Uuid>) -> 
     }
 }
 
+async fn regenerate_key(
+    State(app_state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let mut keys = app_state.keys.lock().await;
+
+    if let Some(key) = keys.iter_mut().find(|key| key.id == id) {
+        key.secret = Uuid::new_v4().to_string();
+        Json(key.clone()).into_response()
+    } else {
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -89,6 +103,7 @@ fn app() -> Router {
         .route("/keys", post(create_key))
         .route("/keys", get(list_keys))
         .route("/keys/:id", delete(delete_key))
+        .route("/keys/:id", post(regenerate_key))
         .with_state(app_state)
 }
 
@@ -122,6 +137,10 @@ mod tests {
 
         async fn delete_key(&self, id: Uuid) -> TestResponse {
             self.server.delete(&format!("/keys/{}", id)).await
+        }
+
+        async fn regenerate_key(&self, id: Uuid) -> TestResponse {
+            self.server.post(&format!("/keys/{}", id)).await
         }
     }
 
@@ -182,5 +201,26 @@ mod tests {
 
         let list_response = client.list_keys().await;
         assert_eq!(list_response.json::<Vec<ProtectedApiKey>>().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_regenerate_key() {
+        let client = TestClient::new();
+
+        let api_key_name = String::from("my api key");
+        let create_response = client
+            .create_key(InputApiKey {
+                name: api_key_name.clone(),
+            })
+            .await;
+        let original_key = create_response.json::<ApiKey>();
+
+        let regenerate_response = client.regenerate_key(original_key.id).await;
+        assert_eq!(regenerate_response.status_code(), 200);
+
+        let regenerated_key = regenerate_response.json::<ApiKey>();
+        assert_eq!(regenerated_key.id, original_key.id);
+        assert_eq!(regenerated_key.name, original_key.name);
+        assert_ne!(regenerated_key.secret, original_key.secret);
     }
 }
