@@ -1,11 +1,13 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
+    middleware,
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
+use axum_auth_provider::{auth_middleware, cached_jwk_set::CachedJwkSet, AuthProvider};
 use clap::Parser;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -16,6 +18,12 @@ pub struct Cli {
     host: String,
     #[clap(long, default_value = "3000")]
     post: u16,
+    #[clap(long)]
+    audience: String,
+    #[clap(long)]
+    issuer_base_url: String,
+    #[clap(long, default_value = "86400")]
+    jwk_set_cache_duration: u64,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -126,17 +134,28 @@ async fn healthz() -> impl IntoResponse {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let listener = tokio::net::TcpListener::bind((cli.host, cli.post))
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind((cli.host, cli.post)).await?;
 
-    axum::serve(listener, app()).await.unwrap();
+    let auth_provider = Arc::new(
+        CachedJwkSet::builder()
+            .issuer(cli.issuer_base_url)
+            .duration(Duration::from_secs(cli.jwk_set_cache_duration))
+            .validator(Arc::new(move |mut validation| {
+                validation.set_audience(&[&cli.audience]);
+                validation.to_owned()
+            }))
+            .build()?,
+    );
+
+    axum::serve(listener, app(auth_provider)).await?;
+
+    Ok(())
 }
 
-fn app() -> Router {
+fn app(auth_provider: Arc<dyn AuthProvider + Send + Sync>) -> Router {
     let app_state = AppState::default();
 
     Router::new()
@@ -145,15 +164,47 @@ fn app() -> Router {
         .route("/keys/:id", delete(delete_key))
         .route("/keys/:id", post(regenerate_key))
         .route("/lookup", post(lookup_key))
-        .route("/healthz", get(healthz))
         .with_state(app_state)
+        .layer(middleware::from_fn_with_state(
+            auth_provider,
+            auth_middleware,
+        ))
+        .route("/healthz", get(healthz))
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::async_trait;
+    use axum_auth_provider::{AuthError, Claims};
     use axum_test::{TestResponse, TestServer};
+    use jsonwebtoken::{jwk::JwkSet, TokenData};
 
     use super::*;
+
+    struct TestAuthProvider;
+
+    impl TestAuthProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self)
+        }
+    }
+
+    #[async_trait]
+    impl AuthProvider for TestAuthProvider {
+        async fn jwk_set(&self) -> Result<JwkSet, AuthError> {
+            todo!()
+        }
+
+        async fn verify(&self, _: &str) -> Result<TokenData<Claims>, AuthError> {
+            Ok(TokenData {
+                header: Default::default(),
+                claims: Claims {
+                    sub: "test".to_string(),
+                    exp: 0,
+                },
+            })
+        }
+    }
 
     struct TestClient {
         server: TestServer,
@@ -162,7 +213,7 @@ mod tests {
     impl TestClient {
         fn new() -> Self {
             Self {
-                server: TestServer::new(app()).unwrap(),
+                server: TestServer::new(app(TestAuthProvider::new())).unwrap(),
             }
         }
 
@@ -170,25 +221,36 @@ mod tests {
             self.server
                 .post("/keys")
                 .json(&serde_json::to_value(key).unwrap())
+                .add_header("Authorization", "Bearer test_token")
                 .await
         }
 
         async fn list_keys(&self) -> TestResponse {
-            self.server.get("/keys").await
+            self.server
+                .get("/keys")
+                .add_header("Authorization", "Bearer test_token")
+                .await
         }
 
         async fn delete_key(&self, id: Uuid) -> TestResponse {
-            self.server.delete(&format!("/keys/{}", id)).await
+            self.server
+                .delete(&format!("/keys/{}", id))
+                .add_header("Authorization", "Bearer test_token")
+                .await
         }
 
         async fn regenerate_key(&self, id: Uuid) -> TestResponse {
-            self.server.post(&format!("/keys/{}", id)).await
+            self.server
+                .post(&format!("/keys/{}", id))
+                .add_header("Authorization", "Bearer test_token")
+                .await
         }
 
         async fn lookup_key(&self, secret: String) -> TestResponse {
             self.server
                 .post("/lookup")
                 .json(&LookupSecret { secret })
+                .add_header("Authorization", "Bearer test_token")
                 .await
         }
 
