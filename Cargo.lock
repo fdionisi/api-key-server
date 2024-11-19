@@ -154,7 +154,6 @@ dependencies = [
 [[package]]
 name = "axum-auth-provider"
 version = "0.1.0"
-source = "git+https://github.com/fdionisi/axum-auth-provider#f33b94b32ef225bc8a93d0659fe7165540f70658"
 dependencies = [
  "anyhow",
  "axum",
