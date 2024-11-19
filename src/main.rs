@@ -13,7 +13,7 @@ use axum_auth_provider::{auth_middleware, cached_jwk_set::CachedJwkSet, AuthProv
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::in_memory_storage::InMemoryStorage;
+use crate::{in_memory_storage::InMemoryStorage, uuid_secret_generator::UuidSecretGenerator};
 
 #[derive(clap::Parser)]
 pub struct Cli {
@@ -68,9 +68,15 @@ pub struct LookupSecret {
     pub secret: String,
 }
 
+#[async_trait]
+pub trait SecretGenerator: Send + Sync {
+    async fn generate(&self) -> String;
+}
+
 #[derive(Clone)]
 struct AppState {
     storage_adapter: Arc<dyn StorageAdapter>,
+    secret_generator: Arc<dyn SecretGenerator>,
 }
 
 async fn create_key(
@@ -81,7 +87,7 @@ async fn create_key(
     let api_key = ApiKey {
         id: Uuid::new_v4(),
         name: key.name.clone(),
-        secret: Uuid::new_v4().to_string(),
+        secret: app_state.secret_generator.generate().await,
     };
 
     match app_state
@@ -155,7 +161,7 @@ async fn regenerate_key(
         Ok(mut user_keys) => {
             if let Some(key) = user_keys.iter_mut().find(|key| key.id == id) {
                 let mut updated_key = key.clone();
-                updated_key.secret = Uuid::new_v4().to_string();
+                updated_key.secret = app_state.secret_generator.generate().await;
                 match app_state
                     .storage_adapter
                     .update_key(&token_data.claims.sub, updated_key.clone())
@@ -227,17 +233,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let storage_adapter = InMemoryStorage::new();
+    let secret_generator = UuidSecretGenerator::new();
 
-    axum::serve(listener, app(auth_provider, storage_adapter)).await?;
+    axum::serve(
+        listener,
+        app(auth_provider, storage_adapter, secret_generator),
+    )
+    .await?;
 
     Ok(())
 }
 
 fn app(
-    auth_provider: Arc<dyn AuthProvider + Send + Sync>,
+    auth_provider: Arc<dyn AuthProvider>,
     storage_adapter: Arc<dyn StorageAdapter>,
+    secret_generator: Arc<dyn SecretGenerator>,
 ) -> Router {
-    let app_state = AppState { storage_adapter };
+    let app_state = AppState {
+        storage_adapter,
+        secret_generator,
+    };
 
     Router::new()
         .route("/keys", post(create_key))
@@ -251,6 +266,30 @@ fn app(
             auth_middleware,
         ))
         .route("/healthz", get(healthz))
+}
+
+mod uuid_secret_generator {
+    use std::sync::Arc;
+
+    use axum::async_trait;
+    use uuid::Uuid;
+
+    use crate::SecretGenerator;
+
+    pub struct UuidSecretGenerator;
+
+    impl UuidSecretGenerator {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self)
+        }
+    }
+
+    #[async_trait]
+    impl SecretGenerator for UuidSecretGenerator {
+        async fn generate(&self) -> String {
+            Uuid::new_v4().to_string()
+        }
+    }
 }
 
 mod in_memory_storage {
@@ -373,8 +412,12 @@ mod tests {
     impl TestClient {
         fn new() -> Self {
             Self {
-                server: TestServer::new(app(TestAuthProvider::new(), InMemoryStorage::new()))
-                    .unwrap(),
+                server: TestServer::new(app(
+                    TestAuthProvider::new(),
+                    InMemoryStorage::new(),
+                    UuidSecretGenerator::new(),
+                ))
+                .unwrap(),
             }
         }
 

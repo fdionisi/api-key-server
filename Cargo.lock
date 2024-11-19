@@ -153,7 +153,8 @@ dependencies = [
 
 [[package]]
 name = "axum-auth-provider"
-version = "0.1.0"
+version = "0.2.1"
+source = "git+https://github.com/fdionisi/axum-auth-provider#d7f70d574390e6f8499708cedf2b518bb69e2273"
 dependencies = [
  "anyhow",
  "axum",
@@ -1729,7 +1730,7 @@ dependencies = [
  "fastrand",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

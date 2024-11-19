@@ -5,8 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = "0.7"
-# axum-auth-provider = { git = "https://github.com/fdionisi/axum-auth-provider", version = "0.1.0" }
-axum-auth-provider = { path = "../axum-auth" }
+axum-auth-provider = { git = "https://github.com/fdionisi/axum-auth-provider", version = "0.2.1" }
 clap = { version = "4.5.21", features = ["derive"] }
 jsonwebtoken = "8.3"
 serde = { version = "1.0.209", features = ["derive"] }
