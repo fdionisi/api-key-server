@@ -6,8 +6,17 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use clap::Parser;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+#[derive(clap::Parser)]
+pub struct Cli {
+    #[clap(long, default_value = "0.0.0.0")]
+    host: String,
+    #[clap(long, default_value = "3000")]
+    post: u16,
+}
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct InputApiKey {
@@ -118,7 +127,12 @@ async fn healthz() -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let cli = Cli::parse();
+
+    let listener = tokio::net::TcpListener::bind((cli.host, cli.post))
+        .await
+        .unwrap();
+
     axum::serve(listener, app()).await.unwrap();
 }
 
