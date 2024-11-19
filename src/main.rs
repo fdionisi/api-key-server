@@ -237,14 +237,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(
         listener,
-        app(auth_provider, storage_adapter, secret_generator),
+        router(auth_provider, storage_adapter, secret_generator),
     )
     .await?;
 
     Ok(())
 }
 
-fn app(
+fn router(
     auth_provider: Arc<dyn AuthProvider>,
     storage_adapter: Arc<dyn StorageAdapter>,
     secret_generator: Arc<dyn SecretGenerator>,
@@ -412,7 +412,7 @@ mod tests {
     impl TestClient {
         fn new() -> Self {
             Self {
-                server: TestServer::new(app(
+                server: TestServer::new(router(
                     TestAuthProvider::new(),
                     InMemoryStorage::new(),
                     UuidSecretGenerator::new(),
