@@ -1,7 +1,9 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
+    async_trait,
     extract::{Path, State},
+    http::StatusCode,
     middleware,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -9,8 +11,9 @@ use axum::{
 };
 use axum_auth_provider::{auth_middleware, cached_jwk_set::CachedJwkSet, AuthProvider, Token};
 use clap::Parser;
-use tokio::sync::Mutex;
 use uuid::Uuid;
+
+use crate::in_memory_storage::InMemoryStorage;
 
 #[derive(clap::Parser)]
 pub struct Cli {
@@ -24,6 +27,22 @@ pub struct Cli {
     issuer_base_url: String,
     #[clap(long, default_value = "86400")]
     jwk_set_cache_duration: u64,
+}
+
+#[async_trait]
+pub trait StorageAdapter: Send + Sync {
+    async fn create_key(&self, user_id: &str, key: ApiKey) -> Result<(), StorageError>;
+    async fn list_keys(&self, user_id: &str) -> Result<Vec<ApiKey>, StorageError>;
+    async fn delete_key(&self, user_id: &str, key_id: Uuid) -> Result<(), StorageError>;
+    async fn update_key(&self, user_id: &str, key: ApiKey) -> Result<(), StorageError>;
+    async fn lookup_key(&self, user_id: &str, secret: &str)
+        -> Result<Option<ApiKey>, StorageError>;
+}
+
+#[derive(Debug)]
+pub enum StorageError {
+    NotFound,
+    InternalError(String),
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -49,9 +68,9 @@ pub struct LookupSecret {
     pub secret: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AppState {
-    keys: Arc<Mutex<HashMap<String, Vec<ApiKey>>>>,
+    storage_adapter: Arc<dyn StorageAdapter>,
 }
 
 async fn create_key(
@@ -59,38 +78,48 @@ async fn create_key(
     token_data: Token,
     Json(key): Json<InputApiKey>,
 ) -> impl IntoResponse {
-    let mut keys = app_state.keys.lock().await;
-
     let api_key = ApiKey {
         id: Uuid::new_v4(),
         name: key.name.clone(),
         secret: Uuid::new_v4().to_string(),
     };
 
-    keys.entry(token_data.claims.sub.clone())
-        .or_insert_with(Vec::new)
-        .push(api_key.clone());
-
-    Json(api_key).into_response()
+    match app_state
+        .storage_adapter
+        .create_key(&token_data.claims.sub, api_key.clone())
+        .await
+    {
+        Ok(_) => Json(api_key).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create key: {:?}", e),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_keys(State(app_state): State<AppState>, token_data: Token) -> impl IntoResponse {
-    let mut keys = app_state.keys.lock().await;
-
-    let user_keys = keys
-        .entry(token_data.claims.sub.clone())
-        .or_insert(Vec::new());
-
-    Json(
-        user_keys
-            .iter()
-            .map(|key| ProtectedApiKey {
-                id: key.id.clone(),
-                name: key.name.clone(),
-            })
-            .collect::<Vec<ProtectedApiKey>>(),
-    )
-    .into_response()
+    match app_state
+        .storage_adapter
+        .list_keys(&token_data.claims.sub)
+        .await
+    {
+        Ok(user_keys) => Json(
+            user_keys
+                .iter()
+                .map(|key| ProtectedApiKey {
+                    id: key.id,
+                    name: key.name.clone(),
+                })
+                .collect::<Vec<ProtectedApiKey>>(),
+        )
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list keys: {:?}", e),
+        )
+            .into_response(),
+    }
 }
 
 async fn delete_key(
@@ -98,19 +127,18 @@ async fn delete_key(
     token_data: Token,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let mut keys = app_state.keys.lock().await;
-
-    if let Some(user_keys) = keys.get_mut(&token_data.claims.sub) {
-        let key_index = user_keys.iter().position(|key| key.id == id);
-
-        if let Some(index) = key_index {
-            let _ = user_keys.remove(index);
-            axum::http::StatusCode::NO_CONTENT.into_response()
-        } else {
-            axum::http::StatusCode::NOT_FOUND.into_response()
-        }
-    } else {
-        axum::http::StatusCode::NOT_FOUND.into_response()
+    match app_state
+        .storage_adapter
+        .delete_key(&token_data.claims.sub, id)
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete key: {:?}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -119,17 +147,37 @@ async fn regenerate_key(
     token_data: Token,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let mut keys = app_state.keys.lock().await;
-
-    if let Some(user_keys) = keys.get_mut(&token_data.claims.sub) {
-        if let Some(key) = user_keys.iter_mut().find(|key| key.id == id) {
-            key.secret = Uuid::new_v4().to_string();
-            Json(key.clone()).into_response()
-        } else {
-            axum::http::StatusCode::NOT_FOUND.into_response()
+    match app_state
+        .storage_adapter
+        .list_keys(&token_data.claims.sub)
+        .await
+    {
+        Ok(mut user_keys) => {
+            if let Some(key) = user_keys.iter_mut().find(|key| key.id == id) {
+                let mut updated_key = key.clone();
+                updated_key.secret = Uuid::new_v4().to_string();
+                match app_state
+                    .storage_adapter
+                    .update_key(&token_data.claims.sub, updated_key.clone())
+                    .await
+                {
+                    Ok(_) => Json(updated_key).into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to update key: {:?}", e),
+                    )
+                        .into_response(),
+                }
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
         }
-    } else {
-        axum::http::StatusCode::NOT_FOUND.into_response()
+        Err(StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to regenerate key: {:?}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -138,20 +186,22 @@ async fn lookup_key(
     token_data: Token,
     Json(lookup): Json<LookupSecret>,
 ) -> impl IntoResponse {
-    let keys = app_state.keys.lock().await;
-
-    if let Some(user_keys) = keys.get(&token_data.claims.sub) {
-        if let Some(key) = user_keys.iter().find(|key| key.secret == lookup.secret) {
-            Json(ProtectedApiKey {
-                id: key.id,
-                name: key.name.clone(),
-            })
-            .into_response()
-        } else {
-            axum::http::StatusCode::NOT_FOUND.into_response()
-        }
-    } else {
-        axum::http::StatusCode::NOT_FOUND.into_response()
+    match app_state
+        .storage_adapter
+        .lookup_key(&token_data.claims.sub, &lookup.secret)
+        .await
+    {
+        Ok(Some(key)) => Json(ProtectedApiKey {
+            id: key.id,
+            name: key.name,
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to lookup key: {:?}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -176,13 +226,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?,
     );
 
-    axum::serve(listener, app(auth_provider)).await?;
+    let storage_adapter = InMemoryStorage::new();
+
+    axum::serve(listener, app(auth_provider, storage_adapter)).await?;
 
     Ok(())
 }
 
-fn app(auth_provider: Arc<dyn AuthProvider + Send + Sync>) -> Router {
-    let app_state = AppState::default();
+fn app(
+    auth_provider: Arc<dyn AuthProvider + Send + Sync>,
+    storage_adapter: Arc<dyn StorageAdapter>,
+) -> Router {
+    let app_state = AppState { storage_adapter };
 
     Router::new()
         .route("/keys", post(create_key))
@@ -198,11 +253,90 @@ fn app(auth_provider: Arc<dyn AuthProvider + Send + Sync>) -> Router {
         .route("/healthz", get(healthz))
 }
 
+mod in_memory_storage {
+    use std::{collections::HashMap, sync::Arc};
+
+    use axum::async_trait;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    use crate::{ApiKey, StorageAdapter, StorageError};
+
+    pub struct InMemoryStorage {
+        keys: Arc<Mutex<HashMap<String, Vec<ApiKey>>>>,
+    }
+
+    impl InMemoryStorage {
+        pub fn new() -> Arc<Self> {
+            Arc::new(InMemoryStorage {
+                keys: Arc::new(Mutex::new(HashMap::new())),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl StorageAdapter for InMemoryStorage {
+        async fn create_key(&self, user_id: &str, key: ApiKey) -> Result<(), StorageError> {
+            let mut keys = self.keys.lock().await;
+            keys.entry(user_id.to_string())
+                .or_insert_with(Vec::new)
+                .push(key);
+            Ok(())
+        }
+
+        async fn list_keys(&self, user_id: &str) -> Result<Vec<ApiKey>, StorageError> {
+            let keys = self.keys.lock().await;
+            Ok(keys.get(user_id).cloned().unwrap_or_default())
+        }
+
+        async fn delete_key(&self, user_id: &str, key_id: Uuid) -> Result<(), StorageError> {
+            let mut keys = self.keys.lock().await;
+            if let Some(user_keys) = keys.get_mut(user_id) {
+                if let Some(index) = user_keys.iter().position(|key| key.id == key_id) {
+                    user_keys.remove(index);
+                    Ok(())
+                } else {
+                    Err(StorageError::NotFound)
+                }
+            } else {
+                Err(StorageError::NotFound)
+            }
+        }
+
+        async fn update_key(&self, user_id: &str, key: ApiKey) -> Result<(), StorageError> {
+            let mut keys = self.keys.lock().await;
+            if let Some(user_keys) = keys.get_mut(user_id) {
+                if let Some(existing_key) = user_keys.iter_mut().find(|k| k.id == key.id) {
+                    *existing_key = key;
+                    Ok(())
+                } else {
+                    Err(StorageError::NotFound)
+                }
+            } else {
+                Err(StorageError::NotFound)
+            }
+        }
+
+        async fn lookup_key(
+            &self,
+            user_id: &str,
+            secret: &str,
+        ) -> Result<Option<ApiKey>, StorageError> {
+            let keys = self.keys.lock().await;
+            Ok(keys
+                .get(user_id)
+                .and_then(|user_keys| user_keys.iter().find(|key| key.secret == secret))
+                .cloned())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::async_trait;
     use axum_auth_provider::{AuthError, Claims};
     use axum_test::{TestResponse, TestServer};
+    use in_memory_storage::InMemoryStorage;
     use jsonwebtoken::{jwk::JwkSet, TokenData};
 
     use super::*;
@@ -239,7 +373,8 @@ mod tests {
     impl TestClient {
         fn new() -> Self {
             Self {
-                server: TestServer::new(app(TestAuthProvider::new())).unwrap(),
+                server: TestServer::new(app(TestAuthProvider::new(), InMemoryStorage::new()))
+                    .unwrap(),
             }
         }
 
