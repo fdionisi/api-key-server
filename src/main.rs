@@ -112,6 +112,10 @@ async fn lookup_key(
     }
 }
 
+async fn healthz() -> impl IntoResponse {
+    axum::http::StatusCode::OK
+}
+
 #[tokio::main]
 async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -127,6 +131,7 @@ fn app() -> Router {
         .route("/keys/:id", delete(delete_key))
         .route("/keys/:id", post(regenerate_key))
         .route("/lookup", post(lookup_key))
+        .route("/healthz", get(healthz))
         .with_state(app_state)
 }
 
@@ -171,6 +176,10 @@ mod tests {
                 .post("/lookup")
                 .json(&LookupSecret { secret })
                 .await
+        }
+
+        async fn healthz(&self) -> TestResponse {
+            self.server.get("/healthz").await
         }
     }
 
@@ -253,6 +262,7 @@ mod tests {
         assert_eq!(regenerated_key.name, original_key.name);
         assert_ne!(regenerated_key.secret, original_key.secret);
     }
+
     #[tokio::test]
     async fn test_successful_lookup_key() {
         let client = TestClient::new();
@@ -279,5 +289,12 @@ mod tests {
 
         let invalid_lookup_response = client.lookup_key("invalid_secret".to_string()).await;
         assert_eq!(invalid_lookup_response.status_code(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_healthz() {
+        let client = TestClient::new();
+        let response = client.healthz().await;
+        assert_eq!(response.status_code(), 200);
     }
 }
